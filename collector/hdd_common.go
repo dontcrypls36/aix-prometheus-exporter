@@ -17,7 +17,7 @@ int getDisksInfo(perfstat_disk_total_t *disks_info) {
 	return 0;
 }
 
-int getDiskInfo(char **diskInfo, size_t *disks_len) {
+int getDiskInfo(char ***outChar, uint64_t **outMetrics, size_t *disks_char_len, size_t *disks_metrics_len) {
 	int	tot, ret, i;
 	perfstat_disk_t *di;
 	perfstat_id_t first;
@@ -25,39 +25,65 @@ int getDiskInfo(char **diskInfo, size_t *disks_len) {
 	if (tot > 0 ) {
 		di = calloc(tot, sizeof(perfstat_disk_t));
 		strcpy(first.name, FIRST_DISK);
-		*disks_len = tot*7;
-		*diskInfo = (char *) malloc(sizeof(char)*(*disks_len));
+		*disks_char_len = tot * 3;
+		*disks_metrics_len = tot * 4;
+		char** diskCharInfo = malloc(sizeof(char*)*tot*3);
+		*outMetrics = (uint64_t *) malloc(sizeof(uint64_t)*tot*4);
 		ret = perfstat_disk(&first, di, sizeof(perfstat_disk_t), tot);
 		for (i = 0; i < ret; i++) {
-			int offset = 7 * i;
-			diskInfo[offset] =   di[i].description;
-			diskInfo[offset+1] = di[i].vgname;
-			diskInfo[offset+2] = di[i].adapter;
-			diskInfo[offset+3] = di[i].size;
-			diskInfo[offset+4] = di[i].free;
-			diskInfo[offset+5] = di[i].rblks;
-			diskInfo[offset+6] = di[i].wblks;
+			int offset1 = 3 * i;
+			int offset2 = 4 * i;
+			diskCharInfo[offset1] =   di[i].description;
+			diskCharInfo[offset1+1] = di[i].vgname;
+			diskCharInfo[offset1+2] = di[i].adapter;
+			(*outMetrics)[offset2] = di[i].size;
+			(*outMetrics)[offset2+1] = di[i].free;
+			(*outMetrics)[offset2+2] = di[i].rblks;
+			(*outMetrics)[offset2+3] = di[i].wblks;
 		}
+		*outChar = diskCharInfo;
 		return ret;
 	}
 	return -1;
+}
+
+char** getDiskInfoMock() {
+	char** diskInfo = malloc(sizeof(char*));
+	strcpy(diskInfo[0], "FAKE1");
+	return diskInfo;
 }
 */
 import "C"
 import (
 	"fmt"
 	"github.com/prometheus/client_golang/prometheus"
-	"reflect"
-	"strings"
 	"unsafe"
 )
 
 const (
 	diskInfoSubsystem = "disk"
-	maxDiskLen        = 1024 * 4
+	maxDiskCharLen    = 256 * 3
+	maxDiskMetricsLen = 256 * 4
+	descrCount        = 3
+	metricsCount      = 4
 )
 
-type diskInfoCollector struct{}
+type diskInfoCollector struct {
+	disk *prometheus.Desc
+}
+
+var (
+	diskDescMB = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, diskInfoSubsystem, "MB"),
+		"Characteristic measured in MB",
+		[]string{"description", "vgName", "adapter"}, nil,
+	)
+	diskDescBytes = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, diskInfoSubsystem, "Bytes"),
+		"Characteristic measured in bytes",
+		[]string{"description", "vgName", "adapter"}, nil,
+	)
+)
 
 func init() {
 	registerCollector("diskinfo", true, NewDiskCollector)
@@ -68,58 +94,55 @@ func NewDiskCollector() (Collector, error) {
 }
 
 func (c *diskInfoCollector) Update(ch chan<- prometheus.Metric) error {
-	var metricType prometheus.ValueType
-	diskInfo, err := c.getInfo()
+	diskFields := []string{"size", "free", "wblks", "rblks"}
+	labelFields := []string{"description", "vgName", "adapter"}
+	numbers, descriptions, metrics, err := c.getInfo()
 	if err != nil {
 		return fmt.Errorf("couldn't get diskinfo: %s", err)
 	}
-	for k, v := range diskInfo {
-		if strings.HasSuffix(k, "_total") {
-			metricType = prometheus.CounterValue
-		} else {
-			metricType = prometheus.GaugeValue
+	for i := 0; i < numbers; i++ {
+		descrSlice := descriptions[(i * descrCount):((i + 1) * descrCount)]
+		metricSlice := metrics[(i * metricsCount):((i + 1) * metricsCount)]
+		for i, value := range metricSlice {
+			ch <- prometheus.MustNewConstMetric(
+				prometheus.NewDesc(
+					prometheus.BuildFQName(namespace, diskInfoSubsystem, diskFields[i%metricsCount]),
+					fmt.Sprintf("Disk information field %s.", diskFields[i%metricsCount]),
+					labelFields, nil,
+				),
+				prometheus.GaugeValue, value, descrSlice...)
 		}
-		ch <- prometheus.MustNewConstMetric(
-			prometheus.NewDesc(
-				prometheus.BuildFQName(namespace, diskInfoSubsystem, k),
-				fmt.Sprintf("Disk information field %s.", k),
-				nil, nil,
-			),
-			metricType, v,
-		)
+
 	}
 	return nil
 }
 
-func (c *diskInfoCollector) getInfo() (map[string]float64, error) {
-
-	var disksInfo C.perfstat_disk_total_t
-
-	if _, err := C.getDisksInfo(&disksInfo); err != nil {
-		return nil, fmt.Errorf("could not collect disk from getDisksInfo: %v", err)
-	}
-	defer C.free(unsafe.Pointer(&disksInfo))
+func (c *diskInfoCollector) getInfo() (int, []string, []float64, error) {
 	var (
-		diskInfo   *C.char
-		diskLength C.size_t
+		diskCharInfo      **C.char
+		diskMetricsInfo   *C.uint64_t
+		diskCharLength    C.size_t
+		diskMetricsLength C.size_t
 	)
-	if _, err := C.getDiskInfo(&diskInfo, &diskLength); err != nil {
-		return nil, fmt.Errorf("could not collect disk from getDiskInfo: %v", err)
+	if disksNumber, err := C.getDiskInfo(&diskCharInfo, &diskMetricsInfo, &diskCharLength, &diskMetricsLength); err != nil {
+		return 0, nil, nil, fmt.Errorf("could not collect disk from getDiskInfo: %v", err)
+	} else {
+		defer C.free(unsafe.Pointer(&diskCharInfo))
+		defer C.free(unsafe.Pointer(&diskMetricsInfo))
+		charInfo := (*[maxDiskCharLen]*C.char)(unsafe.Pointer(diskCharInfo))[:diskCharLength:diskCharLength]
+		metricsInfo := (*[maxDiskMetricsLen]C.u_longlong_t)(unsafe.Pointer(diskMetricsInfo))[:diskMetricsLength:diskMetricsLength]
+		descriptions := make([]string, int(disksNumber)*descrCount)
+		metrics := make([]float64, int(disksNumber)*metricsCount)
+		for i := 0; i < int(disksNumber); i++ {
+			descriptions[i*descrCount] = C.GoString(charInfo[i*descrCount])
+			descriptions[i*descrCount+1] = C.GoString(charInfo[i*descrCount+1])
+			descriptions[i*descrCount+2] = C.GoString(charInfo[i*descrCount+2])
+			metrics[i*metricsCount] = float64(metricsInfo[i*metricsCount])
+			metrics[i*metricsCount+1] = float64(metricsInfo[i*metricsCount+1])
+			metrics[i*metricsCount+2] = float64(metricsInfo[i*metricsCount+2])
+			metrics[i*metricsCount+3] = float64(metricsInfo[i*metricsCount+3])
+		}
+		return int(disksNumber), descriptions, metrics, nil
 	}
-	defer C.free(unsafe.Pointer(&disksInfo))
-	fmt.Println(reflect.TypeOf(diskInfo))
-	dput := (*[maxDiskLen]C.char)(unsafe.Pointer(&diskInfo))[:diskLength:diskLength]
-	fmt.Println(reflect.TypeOf(dput))
-
-	//cpuTicks := make([]float64, diskLength)
-	for _, value := range dput {
-		fmt.Println(reflect.TypeOf(value))
-	}
-
-	return map[string]float64{
-		"number_of_disks": float64(disksInfo.number),
-		//"total_disk_size":  float64(disksInfo.size),
-		//"total_free_space": float64(disksInfo.free),
-	}, nil
 
 }
